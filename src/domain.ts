@@ -2,6 +2,7 @@ import emojiRegex from 'emoji-regex';
 
 export const TIME_ZONE = 'Asia/Seoul';
 export const DAYS = ['일', '월', '화', '수', '목', '금', '토'] as const;
+export const DAILY_SCHEDULE_DAY = 7;
 export const MAX_ROLE_EMOJIS = 20;
 export const MAX_CONTENT_LENGTH = 1900;
 
@@ -48,7 +49,7 @@ export interface PanelState {
 
 export function validateSchedule(input: ScheduleInput): ScheduleInput {
   for (const [name, value, max] of [
-    ['요일', input.day, 6],
+    ['요일', input.day, DAILY_SCHEDULE_DAY],
     ['시', input.hour, 23],
     ['분', input.minute, 59],
   ] as const) {
@@ -111,7 +112,8 @@ export function scheduleMinute(now: Date): {
 const pad = (value: number): string => String(value).padStart(2, '0');
 
 export function formatSchedule(schedule: Schedule): string {
-  return `[${schedule.id}] ${DAYS[schedule.day]}:${pad(schedule.hour)}:${pad(schedule.minute)} - ${schedule.content} <@&${schedule.roleId}>`;
+  const day = schedule.day === DAILY_SCHEDULE_DAY ? '매일' : DAYS[schedule.day];
+  return `[${schedule.id}] ${day}:${pad(schedule.hour)}:${pad(schedule.minute)} - ${schedule.content} <@&${schedule.roleId}>`;
 }
 
 export function formatRoleEmoji(mapping: RoleEmoji): string {

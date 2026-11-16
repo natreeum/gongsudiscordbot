@@ -3,7 +3,7 @@ import {
   type ChatInputCommandInteraction, type Guild,
 } from 'discord.js';
 import {
-  DAYS, MAX_CONTENT_LENGTH, UserError, errorMessage, formatRoleEmoji, formatSchedule,
+  DAILY_SCHEDULE_DAY, DAYS, MAX_CONTENT_LENGTH, UserError, errorMessage, formatRoleEmoji, formatSchedule,
   messagePages, parseEmoji, type RoleEmojiInput, type ScheduleInput,
 } from './domain.js';
 import { assignableRole, mentionRole, usableEmoji, type BotChannel } from './discord.js';
@@ -17,8 +17,11 @@ function command(name: string, description: string, ownerOnly = false): SlashCom
 
 function scheduleOptions(builder: SlashCommandBuilder, required: boolean): SlashCommandBuilder {
   return builder
-    .addIntegerOption(option => option.setName('day').setDescription('매주 반복할 요일 (한국 시간)')
-      .setRequired(required).addChoices(...DAYS.map((name, value) => ({ name: `${name}요일`, value }))))
+    .addIntegerOption(option => option.setName('day').setDescription('반복할 요일 또는 매일 (한국 시간)')
+      .setRequired(required).addChoices(
+        ...DAYS.map((name, value) => ({ name: `${name}요일`, value })),
+        { name: '매일', value: DAILY_SCHEDULE_DAY },
+      ))
     .addIntegerOption(option => option.setName('hour').setDescription('시 (0~23)').setRequired(required).setMinValue(0).setMaxValue(23))
     .addIntegerOption(option => option.setName('minute').setDescription('분 (0~59)').setRequired(required).setMinValue(0).setMaxValue(59))
     .addStringOption(option => option.setName('content').setDescription('전송할 내용').setRequired(required).setMinLength(1).setMaxLength(MAX_CONTENT_LENGTH))
@@ -37,7 +40,7 @@ function roleOptions(builder: SlashCommandBuilder, required: boolean): SlashComm
 }
 
 export const commandDefinitions = [
-  scheduleOptions(command('addschedule', '매주 반복되는 스케줄을 추가합니다.'), true),
+  scheduleOptions(command('addschedule', '매주 또는 매일 반복되는 스케줄을 추가합니다.'), true),
   command('lsschedule', '등록된 스케줄 목록을 확인합니다.'),
   scheduleOptions(indexOption(command('modschedule', '기존 스케줄에서 지정한 항목을 수정합니다.')), false),
   indexOption(command('rmschedule', '스케줄을 삭제합니다.')),
@@ -112,7 +115,7 @@ async function execute(interaction: ChatInputCommandInteraction, ctx: CommandCon
     }
     case 'lsschedule': {
       const list = store.schedules(guildId);
-      return list.length ? ['스케줄 목록 (Asia/Seoul, 매주 반복)', ...list.map(formatSchedule)] : ['등록된 스케줄이 없습니다.'];
+      return list.length ? ['스케줄 목록 (Asia/Seoul, 지정 요일 또는 매일 반복)', ...list.map(formatSchedule)] : ['등록된 스케줄이 없습니다.'];
     }
     case 'modschedule': {
       const id = interaction.options.getInteger('idx', true);

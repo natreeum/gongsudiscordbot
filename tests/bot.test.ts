@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
 import { MessageFlags, type Client, type MessageCreateOptions, type MessageEditOptions } from 'discord.js';
 import { canRunCommand } from '../src/commands.js';
 import { readConfig } from '../src/config.js';
 import { DiscordPanelGateway, type BotChannel } from '../src/discord.js';
 import {
-  formatSchedule, parseEmoji, reactionKey, scheduleMinute, validateSchedule,
+  DAILY_SCHEDULE_DAY, formatSchedule, parseEmoji, reactionKey, scheduleMinute, validateSchedule,
   type PanelState, type RoleEmoji, type RoleEmojiInput, type ScheduleInput,
 } from '../src/domain.js';
 import { RoleService, type PanelGateway, type ReactionEvent } from '../src/roles.js';
@@ -52,10 +53,11 @@ test('한국 시간의 일요일에서 월요일로 넘어가는 날짜·분을 
 });
 
 test('스케줄 입력의 잘못된 시간과 빈 내용을 거부한다', () => {
-  for (const patch of [{ day: 7 }, { day: -1 }, { hour: 24 }, { minute: 60 }, { minute: 1.5 }, { content: '  ' }, { content: 'x'.repeat(1901) }]) {
+  for (const patch of [{ day: 8 }, { day: -1 }, { day: 1.5 }, { hour: 24 }, { minute: 60 }, { minute: 1.5 }, { content: '  ' }, { content: 'x'.repeat(1901) }]) {
     assert.throws(() => validateSchedule({ ...input, ...patch }));
   }
   assert.equal(validateSchedule({ ...input, content: ' 출발 ' }).content, '출발');
+  assert.equal(validateSchedule({ ...input, day: DAILY_SCHEDULE_DAY }).day, DAILY_SCHEDULE_DAY);
 });
 
 test('복합 Unicode 이모지를 허용하고 변형 선택자와 커스텀 이모지 이름을 정규화한다', () => {
@@ -94,6 +96,80 @@ test('삭제 후에도 ID를 유지하고 다른 서버의 항목을 수정하�
   assert.equal(formatSchedule(updated), `[${second.id}] 월:00:00 - 두 번째 <@&${roleId}>`);
 });
 
+test('매일과 특정 요일 사이의 변경은 같은 ID 한 건을 유지한다', t => {
+  const store = memory(t);
+  const schedule = store.addSchedule(guildId, input);
+  const daily = store.updateSchedule(guildId, schedule.id, { day: DAILY_SCHEDULE_DAY });
+  assert.equal(formatSchedule(daily), `[${schedule.id}] 매일:09:05 - 출발합니다 <@&${roleId}>`);
+  for (let day = 0; day < 7; day++) {
+    assert.deepEqual(store.dueSchedules(guildId, day, 9, 5).map(value => value.id), [schedule.id]);
+  }
+  store.updateSchedule(guildId, schedule.id, { day: 0 });
+  assert.equal(store.schedules(guildId).length, 1);
+  assert.equal(store.schedule(guildId, schedule.id).day, 0);
+  assert.equal(store.dueSchedules(guildId, 0, 9, 5).length, 1);
+  assert.equal(store.dueSchedules(guildId, 1, 9, 5).length, 0);
+  store.removeSchedule(guildId, schedule.id);
+  assert.equal(store.schedules(guildId).length, 0);
+});
+
+for (const keepSchedule of [true, false]) {
+  test(`기존 DB 마이그레이션은 발송 이력과 삭제된 ID를 보존한다 (남은 스케줄: ${keepSchedule})`, async t => {
+    const directory = mkdtempSync(join(tmpdir(), 'gongsu-migration-'));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const path = join(directory, 'bot.sqlite');
+    const legacy = new DatabaseSync(path);
+    try {
+      legacy.exec(`
+        CREATE TABLE schedules (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          guild_id TEXT NOT NULL,
+          day INTEGER NOT NULL CHECK (day BETWEEN 0 AND 6),
+          hour INTEGER NOT NULL CHECK (hour BETWEEN 0 AND 23),
+          minute INTEGER NOT NULL CHECK (minute BETWEEN 0 AND 59),
+          content TEXT NOT NULL,
+          role_id TEXT NOT NULL
+        );
+        CREATE INDEX schedules_due ON schedules(guild_id, day, hour, minute);
+        CREATE TABLE schedule_runs (
+          schedule_id INTEGER NOT NULL,
+          occurrence TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'claimed',
+          detail TEXT,
+          PRIMARY KEY (schedule_id, occurrence)
+        );
+      `);
+      const insert = legacy.prepare('INSERT INTO schedules (id, guild_id, day, hour, minute, content, role_id) VALUES (?, ?, ?, ?, ?, ?, ?)');
+      for (const id of [1, 73]) insert.run(id, guildId, input.day, input.hour, input.minute, input.content, input.roleId);
+      legacy.exec('DELETE FROM schedules WHERE id = 73');
+      if (!keepSchedule) legacy.exec('DELETE FROM schedules');
+      const run = legacy.prepare('INSERT INTO schedule_runs (schedule_id, occurrence, status) VALUES (?, ?, ?)');
+      for (const id of [1, 73]) run.run(id, '2026-11-16T09:05', 'sent');
+    } finally { legacy.close(); }
+
+    let store = new Store(path);
+    try {
+      assert.deepEqual(store.schedules(guildId).map(schedule => ({ ...schedule })), keepSchedule ? [{ ...input, id: 1, guildId }] : []);
+      assert.equal(store.claimSchedule(1, '2026-11-16T09:05'), false);
+      assert.equal(store.claimSchedule(73, '2026-11-16T09:05'), false);
+      const daily = store.addSchedule(guildId, { ...input, day: DAILY_SCHEDULE_DAY });
+      assert.ok(daily.id > 73);
+      const sent: number[] = [];
+      const send = async (schedule: { id: number }): Promise<void> => { sent.push(schedule.id); };
+      await new Scheduler(store, guildId, send).tick(mondayMorning);
+      assert.deepEqual(sent, [daily.id]);
+      store.close();
+      store = new Store(path);
+      assert.equal(store.schedule(guildId, daily.id).day, DAILY_SCHEDULE_DAY);
+      const scheduler = new Scheduler(store, guildId, send);
+      await scheduler.tick(mondayMorning);
+      assert.deepEqual(sent, [daily.id]);
+      await scheduler.tick(new Date('2026-11-17T00:05:00Z'));
+      assert.deepEqual(sent, [daily.id, daily.id]);
+    } finally { store.close(); }
+  });
+}
+
 test('이모지와 역할 중복을 거부하고 잘못된 수정은 기존 설정을 유지한다', t => {
   const store = memory(t);
   const first = store.addRoleEmoji(guildId, mapping());
@@ -126,6 +202,28 @@ test('현재 분에 해당하는 스케줄만 보내고 다음 주에는 다시 
   assert.deepEqual(sent, [due.id]);
   await scheduler.tick(new Date('2026-11-23T00:05:00Z'));
   assert.deepEqual(sent, [due.id, due.id]);
+});
+
+test('매일 스케줄은 한국 시간 자정에 매일 한 번 보내고 주간 스케줄과 함께 실행한다', async t => {
+  const store = memory(t);
+  const daily = store.addSchedule(guildId, { ...input, day: DAILY_SCHEDULE_DAY, hour: 0, minute: 0 });
+  const weekly = store.addSchedule(guildId, { ...input, hour: 0, minute: 0 });
+  store.addSchedule(guildId, { ...input, day: DAILY_SCHEDULE_DAY, hour: 0, minute: 1 });
+  store.addSchedule('other-guild', { ...input, day: DAILY_SCHEDULE_DAY, hour: 0, minute: 0 });
+  const sent: number[] = [];
+  const expected: number[] = [];
+  const scheduler = new Scheduler(store, guildId, async schedule => { sent.push(schedule.id); });
+  const firstMidnight = Date.parse('2026-11-15T15:00:00Z'); // 월요일 00:00 KST
+  for (let day = 0; day < 8; day++) {
+    const midnight = firstMidnight + day * 24 * 60 * 60 * 1000;
+    await scheduler.tick(new Date(midnight - 1000));
+    assert.deepEqual(sent, expected);
+    await scheduler.tick(new Date(midnight));
+    await scheduler.tick(new Date(midnight + 59_000));
+    expected.push(daily.id);
+    if (day % 7 === 0) expected.push(weekly.id);
+    assert.deepEqual(sent, expected);
+  }
 });
 
 test('DB를 다시 열어도 설정과 같은 분의 발송 이력이 유지된다', async t => {

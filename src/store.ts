@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import {
-  MAX_ROLE_EMOJIS, UserError, validateSchedule,
+  DAILY_SCHEDULE_DAY, MAX_ROLE_EMOJIS, UserError, validateSchedule,
   type PanelState, type RoleEmoji, type RoleEmojiInput,
   type Schedule, type ScheduleInput,
 } from './domain.js';
@@ -13,6 +13,7 @@ export class Store {
 
   constructor(path: string) {
     this.db = new DatabaseSync(path, { timeout: 5000 });
+    // Create the original schema first; versioned migrations also apply to new databases.
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
@@ -55,9 +56,45 @@ export class Store {
         mappings_json TEXT NOT NULL
       );
     `);
+    try { this.migrateSchedules(); }
+    catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   close(): void { this.db.close(); }
+
+  private migrateSchedules(): void {
+    this.transaction(() => {
+      if (this.db.prepare('PRAGMA user_version').get()?.user_version !== 0) return;
+      const previousSequence = this.db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'schedules'").get()?.seq ?? 0;
+      // Rebuild the CHECK constraint atomically. schedule_runs retains the original IDs.
+      this.db.exec(`
+        CREATE TABLE schedules_v1 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          guild_id TEXT NOT NULL,
+          day INTEGER NOT NULL CHECK (day BETWEEN 0 AND 7),
+          hour INTEGER NOT NULL CHECK (hour BETWEEN 0 AND 23),
+          minute INTEGER NOT NULL CHECK (minute BETWEEN 0 AND 59),
+          content TEXT NOT NULL,
+          role_id TEXT NOT NULL
+        );
+        INSERT INTO schedules_v1 (id, guild_id, day, hour, minute, content, role_id)
+          SELECT id, guild_id, day, hour, minute, content, role_id FROM schedules;
+        DROP TABLE schedules;
+        ALTER TABLE schedules_v1 RENAME TO schedules;
+        CREATE INDEX schedules_due ON schedules(guild_id, day, hour, minute);
+      `);
+      // Deleted IDs must not be reused: their delivery history can still exist.
+      const updated = this.db.prepare("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'schedules'")
+        .run(previousSequence);
+      if (updated.changes === 0) {
+        this.db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run('schedules', previousSequence);
+      }
+      this.db.exec('PRAGMA user_version = 1');
+    });
+  }
 
   transaction<T>(work: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
@@ -103,8 +140,8 @@ export class Store {
   }
 
   dueSchedules(guildId: string, day: number, hour: number, minute: number): Schedule[] {
-    return this.db.prepare(`SELECT ${scheduleColumns} FROM schedules WHERE guild_id = ? AND day = ? AND hour = ? AND minute = ? ORDER BY id`)
-      .all(guildId, day, hour, minute) as unknown as Schedule[];
+    return this.db.prepare(`SELECT ${scheduleColumns} FROM schedules WHERE guild_id = ? AND day IN (?, ?) AND hour = ? AND minute = ? ORDER BY id`)
+      .all(guildId, day, DAILY_SCHEDULE_DAY, hour, minute) as unknown as Schedule[];
   }
 
   claimSchedule(id: number, occurrence: string): boolean {
