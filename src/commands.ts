@@ -92,7 +92,7 @@ async function roleInput(interaction: ChatInputCommandInteraction, guild: Guild,
 }
 
 const panelResult = (updated: boolean): string => updated
-  ? '\n역할 안내 메시지를 새로 생성했습니다.'
+  ? '\n역할 안내 메시지를 갱신했습니다.'
   : '\n설정은 저장됐지만 안내 메시지를 갱신하지 못했습니다. 30초마다 자동 재시도합니다. 갱신 전까지 반응 처리가 중지됩니다.';
 
 async function execute(interaction: ChatInputCommandInteraction, ctx: CommandContext): Promise<string[]> {

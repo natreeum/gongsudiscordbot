@@ -1,8 +1,8 @@
 import {
-  ChannelType, PermissionFlagsBits,
+  ChannelType, MessageFlags, PermissionFlagsBits,
   type Client, type Guild, type Role, type TextChannel, type NewsChannel,
 } from 'discord.js';
-import { UserError, type EmojiValue, type PanelState, type Schedule } from './domain.js';
+import { reactionKey, UserError, type EmojiValue, type PanelState, type RoleEmoji, type Schedule } from './domain.js';
 import type { PanelGateway } from './roles.js';
 
 export type BotChannel = TextChannel | NewsChannel;
@@ -28,7 +28,10 @@ export async function assertChannelPermissions(channel: BotChannel, reactions: b
     [PermissionFlagsBits.SendMessages, '메시지 보내기'],
     [PermissionFlagsBits.ReadMessageHistory, '메시지 기록 보기'],
   ];
-  if (reactions) required.push([PermissionFlagsBits.AddReactions, '반응 추가']);
+  if (reactions) required.push(
+    [PermissionFlagsBits.AddReactions, '반응 추가'],
+    [PermissionFlagsBits.ManageMessages, '메시지 관리 (변경된 이모지의 반응 정리)'],
+  );
   const missing = required.filter(([flag]) => !permissions?.has(flag)).map(([, name]) => name);
   if (missing.length) throw new Error(`#${channel.name} 채널에 봇 권한이 없습니다: ${missing.join(', ')}`);
   if (reactions && !bot.permissions.has(PermissionFlagsBits.ManageRoles)) {
@@ -94,7 +97,7 @@ export class DiscordPanelGateway implements PanelGateway {
       const channel = panel.channelId === this.channel.id
         ? this.channel : await textChannel(this.client, panel.channelId);
       if (channel.guildId !== this.channel.guildId) throw new Error('저장된 안내 메시지의 서버가 일치하지 않습니다.');
-      const message = await channel.messages.fetch(panel.messageId);
+      const message = await channel.messages.fetch({ message: panel.messageId, force: true });
       if (message.author.id !== this.client.user.id) {
         throw new Error('저장된 안내 메시지가 이 봇의 메시지가 아닙니다.');
       }
@@ -118,12 +121,41 @@ export class DiscordPanelGateway implements PanelGateway {
   }
 
   async create(content: string): Promise<string> {
-    return (await this.channel.send({ content, allowedMentions: { parse: [] } })).id;
+    return (await this.channel.send({
+      content, allowedMentions: { parse: [] }, flags: MessageFlags.SuppressNotifications,
+    })).id;
   }
 
-  async react(messageId: string, emoji: string): Promise<void> {
-    const message = await this.channel.messages.fetch(messageId);
-    await message.react(emoji);
+  async edit(panel: PanelState, content: string): Promise<boolean> {
+    const message = await this.message(panel);
+    if (!message) return false;
+    try {
+      // Edit requests do not inherit the original allowed_mentions; always send it explicitly.
+      await message.edit({ content, allowedMentions: { parse: [] } });
+      return true;
+    } catch (error) {
+      if (hasDiscordCode(error, 10008)) return false;
+      throw error;
+    }
+  }
+
+  async syncReactions(messageId: string, mappings: readonly RoleEmoji[], preservedKeys: ReadonlySet<string>): Promise<void> {
+    const message = await this.channel.messages.fetch({ message: messageId, force: true });
+    const seeded = new Set<string>();
+    // Remove stale/changed emoji first, including users' reactions. This also leaves
+    // space for a replacement when the message already has Discord's 20 emoji limit.
+    for (const reaction of [...message.reactions.cache.values()]) {
+      const key = reactionKey(reaction.emoji);
+      if (key && preservedKeys.has(key)) {
+        if (reaction.me) seeded.add(key);
+      } else {
+        // Emits messageReactionRemoveEmoji, not individual messageReactionRemove events.
+        await reaction.remove();
+      }
+    }
+    for (const mapping of mappings) {
+      if (!seeded.has(mapping.emojiKey)) await message.react(mapping.emojiReaction);
+    }
   }
 
   async setRole(userId: string, roleId: string, enabled: boolean): Promise<void> {

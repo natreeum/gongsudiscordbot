@@ -8,7 +8,8 @@ export interface PanelGateway {
   exists(panel: PanelState): Promise<boolean>;
   delete(panel: PanelState): Promise<void>;
   create(content: string): Promise<string>;
-  react(messageId: string, emoji: string): Promise<void>;
+  edit(panel: PanelState, content: string): Promise<boolean>;
+  syncReactions(messageId: string, mappings: readonly RoleEmoji[], preservedKeys: ReadonlySet<string>): Promise<void>;
   setRole(userId: string, roleId: string, enabled: boolean): Promise<void>;
 }
 
@@ -29,7 +30,7 @@ export function panelContent(mappings: RoleEmoji[]): string {
     '',
     rows || '현재 선택 가능한 역할이 없습니다.',
     '',
-    '안내 메시지가 새로 생성되어도 기존 역할은 유지됩니다. 해제하려면 해당 이모지를 눌렀다가 취소하세요.',
+    '목록이 변경되어도 기존 역할은 유지됩니다. 반응이 초기화된 역할을 해제하려면 해당 이모지를 눌렀다가 취소하세요.',
   ].join('\n');
 }
 
@@ -58,7 +59,9 @@ export class RoleService {
         panel = { guildId: this.guildId, channelId: this.channelId, messageId: null, dirty: true };
         this.store.savePanel(panel);
       }
-      if (panel.channelId !== this.channelId || !panel.messageId) {
+      // Adopt a clean panel from the previous version without clearing its users' reactions.
+      const adopted = this.rememberPanel(panel);
+      if (panel.channelId !== this.channelId || !panel.messageId || adopted) {
         this.store.markPanelDirty(this.guildId);
       } else if (!panel.dirty && !await this.gateway.exists(panel)) {
         this.store.markPanelDirty(this.guildId);
@@ -69,6 +72,7 @@ export class RoleService {
 
   async change<T>(work: () => Promise<T>): Promise<{ value: T; panelUpdated: boolean }> {
     return this.queue.run(async () => {
+      this.rememberPanel(this.store.panel(this.guildId));
       const value = await work();
       try {
         await this.refresh();
@@ -83,34 +87,59 @@ export class RoleService {
 
   async handleReaction(event: ReactionEvent): Promise<void> {
     if (event.guildId !== this.guildId || event.channelId !== this.channelId || !event.emojiKey) return;
+    const observedPanel = this.store.panel(this.guildId);
+    if (!observedPanel || observedPanel.messageId !== event.messageId) return;
+    const applied = this.store.panelMappings(this.guildId, event.messageId)
+      ?? (observedPanel.dirty ? [] : this.store.roleEmojis(this.guildId));
+    const observedMapping = applied.find(row => row.emojiKey === event.emojiKey);
+    if (!observedMapping) return;
     return this.queue.run(async () => {
       const panel = this.store.panel(this.guildId);
       if (!panel || panel.dirty || panel.messageId !== event.messageId) return;
       const mapping = this.store.roleEmojis(this.guildId).find(row => row.emojiKey === event.emojiKey);
-      if (!mapping) return;
+      // A queued event must not acquire a different role when this same message is edited.
+      if (!mapping || mapping.roleId !== observedMapping.roleId) return;
       await this.gateway.setRole(event.userId, mapping.roleId, event.added);
     });
   }
 
-  // Called only while holding the queue. Pending events for the old message are
-  // discarded by message ID; events for the new message run after it is ready.
+  private rememberPanel(panel: PanelState | null): boolean {
+    if (!panel?.messageId || panel.dirty || this.store.panelMappings(this.guildId, panel.messageId) !== null) return false;
+    this.store.savePanelMappings(this.guildId, panel.messageId, this.store.roleEmojis(this.guildId));
+    return true;
+  }
+
+  // Called only while holding the queue. Keep the last applied mapping until every
+  // edit/reaction request succeeds, so retries (including after restart) keep the same diff.
   private async refresh(): Promise<void> {
     const old = this.store.panel(this.guildId);
+    this.rememberPanel(old);
     if (old) this.store.markPanelDirty(this.guildId);
-    if (old?.messageId) await this.gateway.delete(old);
+    if (old?.messageId && old.channelId !== this.channelId) await this.gateway.delete(old);
 
     const panel: PanelState = {
-      guildId: this.guildId, channelId: this.channelId, messageId: null, dirty: true,
+      guildId: this.guildId, channelId: this.channelId,
+      messageId: old?.channelId === this.channelId ? old.messageId : null,
+      dirty: true,
     };
     this.store.savePanel(panel);
     const mappings = this.store.roleEmojis(this.guildId);
-    panel.messageId = await this.gateway.create(panelContent(mappings));
-    // Persist the message before adding reactions, so a partial failure is repairable.
-    this.store.savePanel(panel);
-    for (const mapping of mappings) {
-      await this.gateway.react(panel.messageId, mapping.emojiReaction);
+    let previous = panel.messageId ? this.store.panelMappings(this.guildId, panel.messageId) : null;
+    if (!panel.messageId || !await this.gateway.edit(panel, panelContent(mappings))) {
+      panel.messageId = await this.gateway.create(panelContent(mappings));
+      previous = [];
+      // Persist immediately: a failed reaction request must not create another message on retry.
+      this.store.savePanel(panel);
     }
+    const preservedKeys = new Set((previous ?? [])
+      .filter(before => mappings.some(after => after.emojiKey === before.emojiKey && after.roleId === before.roleId))
+      .map(mapping => mapping.emojiKey));
+    await this.gateway.syncReactions(panel.messageId, mappings, preservedKeys);
     panel.dirty = false;
-    this.store.savePanel(panel);
+    const messageId = panel.messageId;
+    this.store.transaction(() => {
+      this.store.savePanelMappings(this.guildId, messageId, mappings);
+      this.store.savePanel(panel);
+    });
   }
 }

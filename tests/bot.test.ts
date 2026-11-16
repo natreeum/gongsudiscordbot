@@ -3,11 +3,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
+import { MessageFlags, type Client, type MessageCreateOptions, type MessageEditOptions } from 'discord.js';
 import { canRunCommand } from '../src/commands.js';
 import { readConfig } from '../src/config.js';
+import { DiscordPanelGateway, type BotChannel } from '../src/discord.js';
 import {
   formatSchedule, parseEmoji, reactionKey, scheduleMinute, validateSchedule,
-  type PanelState, type RoleEmojiInput, type ScheduleInput,
+  type PanelState, type RoleEmoji, type RoleEmojiInput, type ScheduleInput,
 } from '../src/domain.js';
 import { RoleService, type PanelGateway, type ReactionEvent } from '../src/roles.js';
 import { Scheduler } from '../src/scheduler.js';
@@ -136,6 +138,7 @@ test('DB를 다시 열어도 설정과 같은 분의 발송 이력이 유지된�
     store.addSchedule(guildId, input);
     store.addRoleEmoji(guildId, mapping());
     store.savePanel({ guildId, channelId, messageId: 'panel-1', dirty: false });
+    store.savePanelMappings(guildId, 'panel-1', [mapping()]);
     await new Scheduler(store, guildId, async () => { sent++; }).tick(mondayMorning);
     store.close();
     store = new Store(path);
@@ -143,6 +146,8 @@ test('DB를 다시 열어도 설정과 같은 분의 발송 이력이 유지된�
     assert.equal(sent, 1);
     assert.equal(store.roleEmojis(guildId).length, 1);
     assert.equal(store.panel(guildId)?.messageId, 'panel-1');
+    assert.deepEqual(store.panelMappings(guildId, 'panel-1'), [mapping()]);
+    assert.equal(store.panelMappings(guildId, 'other-message'), null);
   } finally { store.close(); }
 });
 
@@ -179,11 +184,14 @@ test('발송이 진행 중일 때 중복 tick이 같은 알림을 보내지 않�
 
 class FakeGateway implements PanelGateway {
   messages = new Map<string, string>();
-  reactions: string[] = [];
+  reactions = new Map<string, Map<string, Set<string>>>();
   operations: string[] = [];
   assignments: { userId: string; roleId: string; enabled: boolean }[] = [];
   failReact = false;
   failDelete = false;
+  failEdit = false;
+  failRemove = false;
+  beforeSync: (() => Promise<void>) | undefined;
   sequence = 0;
 
   async exists(panel: PanelState): Promise<boolean> {
@@ -192,17 +200,47 @@ class FakeGateway implements PanelGateway {
   async delete(panel: PanelState): Promise<void> {
     if (this.failDelete) throw new Error('delete failed');
     this.operations.push(`delete:${panel.messageId}`);
-    if (panel.messageId) this.messages.delete(panel.messageId);
+    if (panel.messageId) {
+      this.messages.delete(panel.messageId);
+      this.reactions.delete(panel.messageId);
+    }
   }
   async create(content: string): Promise<string> {
     const id = `panel-${++this.sequence}`;
     this.operations.push(`create:${id}`);
     this.messages.set(id, content);
+    this.reactions.set(id, new Map());
     return id;
   }
-  async react(messageId: string, emoji: string): Promise<void> {
-    if (this.failReact) throw new Error('react failed');
-    this.reactions.push(`${messageId}:${emoji}`);
+  async edit(panel: PanelState, content: string): Promise<boolean> {
+    if (this.failEdit) throw new Error('edit failed');
+    if (!panel.messageId || !this.messages.has(panel.messageId)) return false;
+    this.operations.push(`edit:${panel.messageId}`);
+    this.messages.set(panel.messageId, content);
+    return true;
+  }
+  async syncReactions(messageId: string, mappings: readonly RoleEmoji[], preservedKeys: ReadonlySet<string>): Promise<void> {
+    await this.beforeSync?.();
+    const reactions = this.reactions.get(messageId)!;
+    for (const key of [...reactions.keys()]) {
+      if (!preservedKeys.has(key)) {
+        if (this.failRemove) throw new Error('remove failed');
+        reactions.delete(key);
+        this.operations.push(`remove:${key}`);
+      }
+    }
+    for (const mapping of mappings) {
+      if (reactions.get(mapping.emojiKey)?.has('bot')) continue;
+      if (this.failReact) throw new Error('react failed');
+      if (!reactions.has(mapping.emojiKey) && reactions.size >= 20) throw new Error('too many reactions');
+      const users = reactions.get(mapping.emojiKey) ?? new Set<string>();
+      users.add('bot');
+      reactions.set(mapping.emojiKey, users);
+      this.operations.push(`react:${mapping.emojiKey}`);
+    }
+  }
+  choose(messageId: string, emoji: string, user = userId): void {
+    this.reactions.get(messageId)!.get(parseEmoji(emoji).key)!.add(user);
   }
   async setRole(user: string, role: string, enabled: boolean): Promise<void> {
     await Promise.resolve();
@@ -220,15 +258,55 @@ function roleFixture(t: TestContext) {
   return { store, gateway, service, event };
 }
 
-test('설정 변경 시 기존 안내를 먼저 삭제하고 새 안내 하나를 유지한다', async t => {
+test('역할 추가 시 같은 메시지를 수정하고 기존 사용자의 반응을 유지한다', async t => {
   const { store, gateway, service } = roleFixture(t);
   await service.ensurePanel();
-  const result = await service.change(async () => store.addRoleEmoji(guildId, mapping()));
+  await service.change(async () => store.addRoleEmoji(guildId, mapping()));
+  gateway.choose('panel-1', '🎮');
+  const result = await service.change(async () => store.addRoleEmoji(guildId, mapping('📢', otherRoleId)));
   assert.equal(result.panelUpdated, true);
-  assert.deepEqual(gateway.operations, ['create:panel-1', 'delete:panel-1', 'create:panel-2']);
+  assert.equal(gateway.sequence, 1);
+  assert.equal(gateway.operations.some(operation => operation.startsWith('delete:')), false);
+  assert.match(gateway.messages.get('panel-1')!, /📢/);
+  assert.equal(gateway.reactions.get('panel-1')!.get(parseEmoji('🎮').key)!.has(userId), true);
   assert.equal(gateway.messages.size, 1);
+  assert.equal(store.panel(guildId)?.messageId, 'panel-1');
   assert.equal(store.panel(guildId)?.dirty, false);
   assert.equal(gateway.assignments.length, 0); // Refresh does not remove existing roles.
+});
+
+test('이모지 수정·삭제 시 해당 반응만 정리하고 나머지 반응과 역할을 보존한다', async t => {
+  const { store, gateway, service } = roleFixture(t);
+  await service.ensurePanel();
+  const game = await service.change(async () => store.addRoleEmoji(guildId, mapping()));
+  await service.change(async () => store.addRoleEmoji(guildId, mapping('📢', otherRoleId)));
+  gateway.choose('panel-1', '🎮');
+  gateway.choose('panel-1', '📢');
+  await service.change(async () => store.updateRoleEmoji(guildId, game.value.id, mapping('🕹️')));
+  const reactions = gateway.reactions.get('panel-1')!;
+  assert.equal(reactions.has(parseEmoji('🎮').key), false);
+  assert.deepEqual([...reactions.get(parseEmoji('🕹️').key)!], ['bot']);
+  assert.equal(reactions.get(parseEmoji('📢').key)!.has(userId), true);
+  await service.change(async () => store.removeRoleEmoji(guildId, game.value.id));
+  assert.equal(reactions.has(parseEmoji('🕹️').key), false);
+  assert.equal(reactions.get(parseEmoji('📢').key)!.has(userId), true);
+  assert.equal(gateway.assignments.length, 0);
+  assert.equal(gateway.sequence, 1);
+});
+
+test('구버전의 정상 안내 메시지를 처음 적용할 때도 기존 반응을 유지한다', async t => {
+  const { store, gateway, service } = roleFixture(t);
+  store.addRoleEmoji(guildId, mapping());
+  const messageId = await gateway.create('기존 안내');
+  store.savePanel({ guildId, channelId, messageId, dirty: false });
+  await gateway.syncReactions(messageId, store.roleEmojis(guildId), new Set());
+  gateway.choose(messageId, '🎮');
+  assert.equal(store.panelMappings(guildId, messageId), null);
+  await service.ensurePanel();
+  assert.equal(gateway.sequence, 1);
+  assert.equal(gateway.reactions.get(messageId)!.get(parseEmoji('🎮').key)!.has(userId), true);
+  assert.equal(store.panelMappings(guildId, messageId)?.[0]?.roleId, roleId);
+  assert.match(gateway.messages.get(messageId)!, /역할 선택/);
 });
 
 test('재시작 시 저장된 메시지를 재사용하고 유실된 경우 새로 생성한다', async t => {
@@ -243,53 +321,139 @@ test('재시작 시 저장된 메시지를 재사용하고 유실된 경우 새�
   assert.equal(gateway.messages.size, 1);
 });
 
-test('새 안내 메시지의 등록된 이모지만 처리하고 추가·취소 순서를 보존한다', async t => {
+test('현재 안내 메시지의 등록된 이모지만 처리하고 추가·취소 순서를 보존한다', async t => {
   const { store, gateway, service, event } = roleFixture(t);
   await service.ensurePanel();
   await service.change(async () => store.addRoleEmoji(guildId, mapping()));
-  await service.handleReaction(event('panel-1')); // Retired message.
-  await service.handleReaction({ ...event('panel-2'), channelId: 'other-channel' });
-  await service.handleReaction({ ...event('panel-2'), guildId: 'other-guild' });
-  await service.handleReaction({ ...event('panel-2'), emojiKey: parseEmoji('📢').key });
+  await service.handleReaction(event('other-message'));
+  await service.handleReaction({ ...event('panel-1'), channelId: 'other-channel' });
+  await service.handleReaction({ ...event('panel-1'), guildId: 'other-guild' });
+  await service.handleReaction({ ...event('panel-1'), emojiKey: parseEmoji('📢').key });
   assert.equal(gateway.assignments.length, 0);
   await Promise.all([
-    service.handleReaction(event('panel-2', true)),
-    service.handleReaction(event('panel-2', false)),
+    service.handleReaction(event('panel-1', true)),
+    service.handleReaction(event('panel-1', false)),
   ]);
   assert.deepEqual(gateway.assignments, [
     { userId, roleId, enabled: true }, { userId, roleId, enabled: false },
   ]);
 });
 
-test('이모지 등록 실패 후 DB 설정과 메시지 ID를 보존하고 복구한다', async t => {
+test('이모지 등록 실패 후 같은 메시지를 재시도하여 복구한다', async t => {
   const { store, gateway, service, event } = roleFixture(t);
   await service.ensurePanel();
   gateway.failReact = true;
   const result = await service.change(async () => store.addRoleEmoji(guildId, mapping()));
   assert.equal(result.panelUpdated, false);
   assert.equal(store.roleEmojis(guildId).length, 1);
-  assert.equal(store.panel(guildId)?.messageId, 'panel-2');
+  assert.equal(store.panel(guildId)?.messageId, 'panel-1');
   assert.equal(store.panel(guildId)?.dirty, true);
-  await service.handleReaction(event('panel-2'));
+  await service.handleReaction(event('panel-1'));
   assert.equal(gateway.assignments.length, 0);
   gateway.failReact = false;
   await service.ensurePanel();
   assert.equal(gateway.messages.size, 1);
-  assert.equal(store.panel(guildId)?.messageId, 'panel-3');
+  assert.equal(store.panel(guildId)?.messageId, 'panel-1');
+  assert.equal(gateway.sequence, 1);
   assert.equal(store.panel(guildId)?.dirty, false);
 });
 
-test('삭제 실패 시 이전 메시지 반응을 변경된 역할에 적용하지 않는다', async t => {
+test('수정 실패 시 반응을 변경된 역할에 적용하지 않고 같은 메시지에서 복구한다', async t => {
   const { store, gateway, service, event } = roleFixture(t);
   await service.ensurePanel();
   const first = await service.change(async () => store.addRoleEmoji(guildId, mapping()));
-  gateway.failDelete = true;
+  gateway.choose('panel-1', '🎮');
+  gateway.failEdit = true;
   const changed = await service.change(async () => store.updateRoleEmoji(guildId, first.value.id, mapping('🎮', otherRoleId)));
   assert.equal(changed.panelUpdated, false);
-  await service.handleReaction(event('panel-2'));
+  await service.handleReaction(event('panel-1'));
   assert.equal(gateway.assignments.length, 0);
-  gateway.failDelete = false;
+  assert.equal(store.panelMappings(guildId, 'panel-1')?.[0]?.roleId, roleId);
+  gateway.failEdit = false;
   await service.ensurePanel();
-  await service.handleReaction(event('panel-3'));
+  assert.equal(gateway.sequence, 1);
+  assert.equal(gateway.reactions.get('panel-1')!.get(parseEmoji('🎮').key)!.has(userId), false);
+  await service.handleReaction(event('panel-1'));
   assert.deepEqual(gateway.assignments, [{ userId, roleId: otherRoleId, enabled: true }]);
+});
+
+test('반응 정리 실패 후 재시작해도 마지막 적용 기록으로 변경된 이모지만 초기화한다', async t => {
+  const { store, gateway, service } = roleFixture(t);
+  await service.ensurePanel();
+  const game = await service.change(async () => store.addRoleEmoji(guildId, mapping()));
+  await service.change(async () => store.addRoleEmoji(guildId, mapping('📢', otherRoleId)));
+  gateway.choose('panel-1', '🎮');
+  gateway.choose('panel-1', '📢');
+  gateway.failRemove = true;
+  const changed = await service.change(async () => store.updateRoleEmoji(guildId, game.value.id, mapping('🎮', '666666666666666666')));
+  assert.equal(changed.panelUpdated, false);
+  assert.equal(store.panel(guildId)?.dirty, true);
+  gateway.failRemove = false;
+  const restarted = new RoleService(store, guildId, channelId, gateway);
+  await restarted.ensurePanel();
+  const reactions = gateway.reactions.get('panel-1')!;
+  assert.equal(reactions.get(parseEmoji('🎮').key)!.has(userId), false);
+  assert.equal(reactions.get(parseEmoji('📢').key)!.has(userId), true);
+  assert.equal(gateway.sequence, 1);
+  assert.equal(store.panel(guildId)?.dirty, false);
+});
+
+test('수정 중 도착한 반응을 새 역할에 잘못 연결하지 않고 변경 없는 역할의 취소는 처리한다', async t => {
+  const { store, gateway, service, event } = roleFixture(t);
+  await service.ensurePanel();
+  const game = await service.change(async () => store.addRoleEmoji(guildId, mapping()));
+  await service.change(async () => store.addRoleEmoji(guildId, mapping('📢', otherRoleId)));
+  let started!: () => void;
+  let release!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const paused = new Promise<void>(resolve => { release = resolve; });
+  gateway.beforeSync = async () => { started(); await paused; };
+  const changing = service.change(async () => store.updateRoleEmoji(guildId, game.value.id, mapping('🎮', '666666666666666666')));
+  await ready;
+  const oldReaction = service.handleReaction(event('panel-1'));
+  const unchangedReaction = service.handleReaction({ ...event('panel-1', false), emojiKey: parseEmoji('📢').key });
+  release();
+  await Promise.all([changing, oldReaction, unchangedReaction]);
+  assert.deepEqual(gateway.assignments, [{ userId, roleId: otherRoleId, enabled: false }]);
+  await service.handleReaction(event('panel-1'));
+  assert.equal(gateway.assignments[1]?.roleId, '666666666666666666');
+});
+
+test('20개 이모지가 있는 메시지에서도 먼저 정리한 뒤 교체하며 기존 반응을 보존한다', async t => {
+  const { store, gateway, service } = roleFixture(t);
+  for (let index = 0; index < 20; index++) {
+    store.addRoleEmoji(guildId, mapping(String.fromCodePoint(0x1f600 + index), String(BigInt(roleId) + BigInt(index))));
+  }
+  await service.ensurePanel();
+  const first = store.roleEmojis(guildId)[0]!;
+  gateway.choose('panel-1', String.fromCodePoint(0x1f601));
+  const changed = await service.change(async () => store.updateRoleEmoji(guildId, first.id, mapping('🎮')));
+  assert.equal(changed.panelUpdated, true);
+  const reactions = gateway.reactions.get('panel-1')!;
+  assert.equal(reactions.size, 20);
+  assert.equal(reactions.has(first.emojiKey), false);
+  assert.equal(reactions.has(parseEmoji('🎮').key), true);
+  assert.equal(reactions.get(parseEmoji(String.fromCodePoint(0x1f601)).key)!.has(userId), true);
+  assert.equal(gateway.sequence, 1);
+});
+
+test('Discord 수정 요청은 멘션을 차단하고 새 메시지에만 푸시 알림 억제 플래그를 지정한다', async () => {
+  const sends: MessageCreateOptions[] = [];
+  const edits: MessageEditOptions[] = [];
+  const message = {
+    author: { id: 'bot' },
+    edit: async (options: MessageEditOptions) => { edits.push(options); },
+  };
+  const channel = {
+    id: channelId, guildId,
+    messages: { fetch: async () => message },
+    send: async (options: MessageCreateOptions) => { sends.push(options); return { id: 'panel-1' }; },
+  };
+  const gateway = new DiscordPanelGateway({ user: { id: 'bot' } } as unknown as Client<true>, channel as unknown as BotChannel);
+  const content = `<@&${roleId}>`;
+  assert.equal(await gateway.edit({ guildId, channelId, messageId: 'panel-1', dirty: true }, content), true);
+  assert.equal(sends.length, 0);
+  assert.deepEqual(edits, [{ content, allowedMentions: { parse: [] } }]);
+  await gateway.create(content);
+  assert.deepEqual(sends, [{ content, allowedMentions: { parse: [] }, flags: MessageFlags.SuppressNotifications }]);
 });

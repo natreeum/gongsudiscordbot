@@ -49,6 +49,11 @@ export class Store {
         message_id TEXT,
         dirty INTEGER NOT NULL DEFAULT 1
       );
+      CREATE TABLE IF NOT EXISTS role_panel_snapshots (
+        guild_id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        mappings_json TEXT NOT NULL
+      );
     `);
   }
 
@@ -179,5 +184,17 @@ export class Store {
 
   markPanelDirty(guildId: string): void {
     this.db.prepare('UPDATE role_panels SET dirty = 1 WHERE guild_id = ?').run(guildId);
+  }
+
+  panelMappings(guildId: string, messageId: string): RoleEmojiInput[] | null {
+    const row = this.db.prepare('SELECT mappings_json FROM role_panel_snapshots WHERE guild_id = ? AND message_id = ?')
+      .get(guildId, messageId);
+    return row ? JSON.parse(String(row.mappings_json)) as RoleEmojiInput[] : null;
+  }
+
+  savePanelMappings(guildId: string, messageId: string, mappings: readonly RoleEmojiInput[]): void {
+    this.db.prepare(`INSERT INTO role_panel_snapshots (guild_id, message_id, mappings_json) VALUES (?, ?, ?)
+      ON CONFLICT(guild_id) DO UPDATE SET message_id = excluded.message_id, mappings_json = excluded.mappings_json`)
+      .run(guildId, messageId, JSON.stringify(mappings));
   }
 }
