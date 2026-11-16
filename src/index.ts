@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import {
   Client, Events, GatewayIntentBits, MessageFlags, Partials,
   type MessageReaction, type PartialMessageReaction, type PartialUser, type User,
@@ -12,17 +13,36 @@ import { RoleService } from './roles.js';
 import { Scheduler } from './scheduler.js';
 import { Store } from './store.js';
 
+const info = (message: string): void => console.log(`[${new Date().toISOString()}] ${message}`);
+const log = (message: string): void => console.error(`[${new Date().toISOString()}] ${message}`);
+
+function beginInitializationStep(name: string): () => void {
+  const startedAt = performance.now();
+  info(`[초기화] ${name} 시작`);
+  return () => info(`[초기화] ${name} 완료 (${Math.round(performance.now() - startedAt)}ms)`);
+}
+
 async function main(): Promise<void> {
+  const startedAt = performance.now();
+  info('[초기화] 봇 시작');
+  const finishConfig = beginInitializationStep('환경 변수 로드');
   const config = readConfig();
+  finishConfig();
+
+  const finishDatabase = beginInitializationStep('SQLite DB 초기화');
   const dataDirectory = resolve('data');
   mkdirSync(dataDirectory, { recursive: true });
   const store = new Store(resolve(dataDirectory, 'bot.sqlite'));
+  finishDatabase();
+
+  const finishClient = beginInitializationStep('Discord 클라이언트 생성');
   const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions],
     // Old messages and uncached users must still emit reaction removal events after restart.
     partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User],
     allowedMentions: { parse: [] },
   });
+  finishClient();
 
   let context: CommandContext | undefined;
   let roles: RoleService | undefined;
@@ -31,7 +51,6 @@ async function main(): Promise<void> {
   let startup: Promise<void> | undefined;
   let closing = false;
   const commandsInFlight = new Set<Promise<void>>();
-  const log = (message: string): void => console.error(`[${new Date().toISOString()}] ${message}`);
 
   async function shutdown(exitCode = 0): Promise<void> {
     if (closing) return;
@@ -47,7 +66,7 @@ async function main(): Promise<void> {
       await roles?.idle();
       await client.destroy();
       store.close();
-      console.log('봇을 종료했습니다.');
+      info('봇을 종료했습니다.');
     } catch (error) {
       log(`종료 처리 실패: ${errorMessage(error)}`);
       process.exitCode = 1;
@@ -57,28 +76,42 @@ async function main(): Promise<void> {
   }
 
   async function initialize(readyClient: Client<true>): Promise<void> {
+    const finishChannels = beginInitializationStep('스케줄·역할 채널 조회');
     const [scheduleChannel, roleChannel] = await Promise.all([
       textChannel(readyClient, config.scheduleChannelId),
       textChannel(readyClient, config.roleChannelId),
     ]);
     if (scheduleChannel.guildId !== roleChannel.guildId) throw new Error('두 채널은 같은 서버에 있어야 합니다.');
+    finishChannels();
+
+    const finishPermissions = beginInitializationStep('봇 권한 확인');
     await Promise.all([
       assertChannelPermissions(scheduleChannel, false),
       assertChannelPermissions(roleChannel, true),
     ]);
+    finishPermissions();
     if (closing) return;
 
     const guild = roleChannel.guild;
+    const finishCommands = beginInitializationStep(`슬래시 명령어 ${commandDefinitions.length}개 등록`);
     // Upsert only this bot's eight commands; do not bulk-delete unrelated commands.
     await Promise.all(commandDefinitions.map(definition => guild.commands.create(definition.toJSON())));
+    finishCommands();
     if (closing) return;
 
+    const finishPanel = beginInitializationStep('역할 안내 메시지 동기화');
     roles = new RoleService(store, guild.id, roleChannel.id, new DiscordPanelGateway(readyClient, roleChannel), log);
     context = { store, roles, guild, scheduleChannel };
-    try { await roles.ensurePanel(); }
+    let panelReady = false;
+    try {
+      await roles.ensurePanel();
+      panelReady = true;
+      finishPanel();
+    }
     catch (error) { log(`역할 안내 메시지 초기화 실패 (자동 재시도 예정): ${errorMessage(error)}`); }
     if (closing) return;
 
+    const finishRepair = beginInitializationStep('역할 안내 메시지 복구 타이머 설정 (30초 간격)');
     let repairing = false;
     repairTimer = setInterval(() => {
       if (closing || repairing || !roles) return;
@@ -87,16 +120,22 @@ async function main(): Promise<void> {
         .catch(error => log(`역할 안내 메시지 복구 실패: ${errorMessage(error)}`))
         .finally(() => { repairing = false; });
     }, 30_000);
+    finishRepair();
+
+    const finishScheduler = beginInitializationStep('스케줄러 설정 (15초 간격)');
     scheduler = new Scheduler(store, guild.id, async schedule => {
       if (!readyClient.isReady()) throw new Error('Discord 연결이 준비되지 않았습니다.');
       await sendSchedule(scheduleChannel, schedule);
     }, log);
     scheduler.start();
-    console.log(`${readyClient.user.tag} 준비 완료 | 서버: ${guild.name} | 시간대: Asia/Seoul`);
+    finishScheduler();
+    const panelStatus = panelReady ? '동기화 완료' : '복구 대기 (30초 간격)';
+    info(`${readyClient.user.tag} 준비 완료 | 서버: ${guild.name} | 시간대: Asia/Seoul | 역할 안내 메시지: ${panelStatus} | 초기화 소요: ${Math.round(performance.now() - startedAt)}ms`);
   }
 
   client.once(Events.ClientReady, readyClient => {
     if (closing) return;
+    finishLogin();
     startup = initialize(readyClient);
     void startup.catch(error => {
       log(`초기화 실패: ${errorMessage(error)}`);
@@ -150,6 +189,7 @@ async function main(): Promise<void> {
   process.once('SIGINT', () => { void shutdown(); });
   process.once('SIGTERM', () => { void shutdown(); });
 
+  const finishLogin = beginInitializationStep('Discord 로그인 및 Gateway 연결');
   try { await client.login(config.token); }
   catch (error) {
     log(`Discord 로그인 실패: ${errorMessage(error)}`);
@@ -158,6 +198,6 @@ async function main(): Promise<void> {
 }
 
 void main().catch(error => {
-  console.error(`실행 실패: ${errorMessage(error)}`);
+  log(`실행 실패: ${errorMessage(error)}`);
   process.exitCode = 1;
 });
