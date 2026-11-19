@@ -9,6 +9,8 @@ import {
 import { assignableRole, mentionRole, usableEmoji, type BotChannel } from './discord.js';
 import { RoleService } from './roles.js';
 import { Store } from './store.js';
+import { executeMusicCommand, musicCommandDefinitions, musicCommandNames, type MusicCommandContext } from './music-commands.js';
+import { MusicUnavailableError } from './music-domain.js';
 
 function command(name: string, description: string, ownerOnly = false): SlashCommandBuilder {
   return new SlashCommandBuilder().setName(name).setDescription(description)
@@ -49,6 +51,7 @@ export const commandDefinitions = [
   new SlashCommandBuilder().setName('lsroleemoji').setDescription('선택 가능한 이모지·역할 목록을 확인합니다.'),
   roleOptions(indexOption(command('modroleemoji', '이모지·역할 설정을 수정합니다. (서버 소유자 전용)', true)), false),
   indexOption(command('rmroleemoji', '이모지·역할 설정을 삭제합니다. (서버 소유자 전용)', true)),
+  ...musicCommandDefinitions,
 ];
 
 const names = new Set(commandDefinitions.map(definition => definition.name));
@@ -57,11 +60,13 @@ const roleMutations = new Set(['addroleemoji', 'modroleemoji', 'rmroleemoji']);
 export function canRunCommand(name: string, owner: boolean, manageGuild: boolean): boolean {
   if (!names.has(name)) return false;
   if (roleMutations.has(name)) return owner;
+  // Music mutations enforce requester/DJ permissions against the selected track.
+  if (musicCommandNames.has(name)) return true;
   if (name === 'lsroleemoji') return true;
   return owner || manageGuild;
 }
 
-export interface CommandContext {
+export interface CommandContext extends MusicCommandContext {
   store: Store;
   roles: RoleService;
   guild: Guild;
@@ -99,6 +104,7 @@ const panelResult = (updated: boolean): string => updated
   : '\n설정은 저장됐지만 안내 메시지를 갱신하지 못했습니다. 30초마다 자동 재시도합니다. 갱신 전까지 반응 처리가 중지됩니다.';
 
 async function execute(interaction: ChatInputCommandInteraction, ctx: CommandContext): Promise<string[]> {
+  if (musicCommandNames.has(interaction.commandName)) return executeMusicCommand(interaction, ctx);
   const { store, guild, roles, scheduleChannel } = ctx;
   const guildId = guild.id;
   switch (interaction.commandName) {
@@ -175,7 +181,9 @@ export async function handleCommand(interaction: ChatInputCommandInteraction, ct
     }
   } catch (error) {
     if (!(error instanceof UserError)) console.error(`명령어 ${interaction.commandName} 실패: ${errorMessage(error)}`);
-    const content = error instanceof UserError ? error.message : '처리하지 못했습니다. 봇 권한 및 서버 로그를 확인하세요.';
+    const content = error instanceof UserError ? error.message
+      : error instanceof MusicUnavailableError ? '음악 실행 환경을 사용할 수 없습니다. 서버 운영자가 로그와 yt-dlp·FFmpeg 설치를 확인해야 합니다.'
+        : '처리하지 못했습니다. 봇 권한 및 서버 로그를 확인하세요.';
     try {
       if (interaction.deferred || interaction.replied) await interaction.editReply({ content, allowedMentions: { parse: [] } });
       else await interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });

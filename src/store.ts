@@ -4,9 +4,11 @@ import {
   type PanelState, type RoleEmoji, type RoleEmojiInput,
   type Schedule, type ScheduleInput,
 } from './domain.js';
+import { MAX_MUSIC_TRACKS, type MusicMetadata, type MusicTrack } from './music-domain.js';
 
 const scheduleColumns = 'id, guild_id AS guildId, day, hour, minute, content, role_id AS roleId';
 const roleColumns = 'id, guild_id AS guildId, emoji_key AS emojiKey, emoji_display AS emojiDisplay, emoji_reaction AS emojiReaction, role_id AS roleId';
+const musicColumns = 'id, guild_id AS guildId, url, title, duration, requested_by AS requestedBy, status';
 
 export class Store {
   private readonly db: DatabaseSync;
@@ -55,6 +57,17 @@ export class Store {
         message_id TEXT NOT NULL,
         mappings_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS music_tracks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        url TEXT NOT NULL,
+        title TEXT NOT NULL,
+        duration INTEGER NOT NULL CHECK (duration > 0),
+        requested_by TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'playing'))
+      );
+      CREATE INDEX IF NOT EXISTS music_queue ON music_tracks(guild_id, status, id);
+      CREATE UNIQUE INDEX IF NOT EXISTS music_current ON music_tracks(guild_id) WHERE status = 'playing';
     `);
     try { this.migrateSchedules(); }
     catch (error) {
@@ -147,6 +160,45 @@ export class Store {
   claimSchedule(id: number, occurrence: string): boolean {
     return this.db.prepare('INSERT OR IGNORE INTO schedule_runs (schedule_id, occurrence) VALUES (?, ?)')
       .run(id, occurrence).changes === 1;
+  }
+
+  musicTracks(guildId: string): MusicTrack[] {
+    return this.db.prepare(`SELECT ${musicColumns} FROM music_tracks WHERE guild_id = ? ORDER BY CASE status WHEN 'playing' THEN 0 ELSE 1 END, id`)
+      .all(guildId) as unknown as MusicTrack[];
+  }
+
+  addMusicTrack(guildId: string, requestedBy: string, metadata: MusicMetadata): MusicTrack {
+    return this.transaction(() => {
+      if (this.musicTracks(guildId).length >= MAX_MUSIC_TRACKS) {
+        throw new UserError(`재생 중인 곡을 포함해 최대 ${MAX_MUSIC_TRACKS}곡까지 등록할 수 있습니다.`);
+      }
+      if (!metadata.title.trim() || !Number.isSafeInteger(metadata.duration) || metadata.duration <= 0) {
+        throw new UserError('제목과 전체 재생시간을 확인할 수 있는 영상만 등록할 수 있습니다.');
+      }
+      const result = this.db.prepare('INSERT INTO music_tracks (guild_id, url, title, duration, requested_by) VALUES (?, ?, ?, ?, ?)')
+        .run(guildId, metadata.url, metadata.title, metadata.duration, requestedBy);
+      return this.db.prepare(`SELECT ${musicColumns} FROM music_tracks WHERE id = ?`)
+        .get(result.lastInsertRowid) as unknown as MusicTrack;
+    });
+  }
+
+  claimMusicTrack(guildId: string): MusicTrack | undefined {
+    return this.transaction(() => {
+      const track = this.musicTracks(guildId)[0];
+      if (!track) return undefined;
+      if (track.status === 'queued') {
+        this.db.prepare("UPDATE music_tracks SET status = 'playing' WHERE guild_id = ? AND id = ?").run(guildId, track.id);
+      }
+      return { ...track, status: 'playing' };
+    });
+  }
+
+  removeMusicTrack(guildId: string, id: number): void {
+    this.db.prepare('DELETE FROM music_tracks WHERE guild_id = ? AND id = ?').run(guildId, id);
+  }
+
+  clearWaitingMusic(guildId: string): number {
+    return Number(this.db.prepare("DELETE FROM music_tracks WHERE guild_id = ? AND status = 'queued'").run(guildId).changes);
   }
 
   finishSchedule(id: number, occurrence: string, error?: string): void {

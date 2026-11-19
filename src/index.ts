@@ -12,6 +12,9 @@ import { assertChannelPermissions, DiscordPanelGateway, sendSchedule, textChanne
 import { RoleService } from './roles.js';
 import { Scheduler } from './scheduler.js';
 import { Store } from './store.js';
+import { MusicService } from './music.js';
+import { DiscordMusicPlayback, musicChannel } from './music-voice.js';
+import { YouTubeSource } from './youtube.js';
 
 const info = (message: string): void => console.log(`[${new Date().toISOString()}] ${message}`);
 const log = (message: string): void => console.error(`[${new Date().toISOString()}] ${message}`);
@@ -37,7 +40,7 @@ async function main(): Promise<void> {
 
   const finishClient = beginInitializationStep('Discord 클라이언트 생성');
   const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions],
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.GuildVoiceStates],
     // Old messages and uncached users must still emit reaction removal events after restart.
     partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.User],
     allowedMentions: { parse: [] },
@@ -47,6 +50,7 @@ async function main(): Promise<void> {
   let context: CommandContext | undefined;
   let roles: RoleService | undefined;
   let scheduler: Scheduler | undefined;
+  let music: MusicService | undefined;
   let repairTimer: NodeJS.Timeout | undefined;
   let startup: Promise<void> | undefined;
   let closing = false;
@@ -61,7 +65,8 @@ async function main(): Promise<void> {
     deadline.unref();
     try {
       await startup?.catch(() => undefined);
-      await scheduler?.stop();
+      // Abort metadata retrieval and streaming before waiting for music commands.
+      await Promise.all([scheduler?.stop(), music?.close()]);
       await Promise.allSettled(commandsInFlight);
       await roles?.idle();
       await client.destroy();
@@ -94,7 +99,7 @@ async function main(): Promise<void> {
 
     const guild = roleChannel.guild;
     const finishCommands = beginInitializationStep(`슬래시 명령어 ${commandDefinitions.length}개 등록`);
-    // Upsert only this bot's eight commands; do not bulk-delete unrelated commands.
+    // Upsert only this bot's commands; do not bulk-delete unrelated commands.
     await Promise.all(commandDefinitions.map(definition => guild.commands.create(definition.toJSON())));
     finishCommands();
     if (closing) return;
@@ -129,8 +134,31 @@ async function main(): Promise<void> {
     }, log);
     scheduler.start();
     finishScheduler();
+
+    if (config.music) {
+      const finishMusic = beginInitializationStep('음악 실행 환경 확인 및 DB 재생목록 복원');
+      const source = new YouTubeSource(config.music, log);
+      try {
+        await source.check();
+        await musicChannel(readyClient, guild.id, config.music);
+        const djRole = await guild.roles.fetch(config.music.djRoleId);
+        if (!djRole || djRole.id === guild.id) throw new Error('MUSIC_DJ_ROLE_ID는 @everyone 이외의 서버 역할이어야 합니다.');
+        if (closing) return;
+        const playback = new DiscordMusicPlayback(readyClient, guild.id, config.music, source, log);
+        music = new MusicService(store, guild.id, source, playback, info);
+        context.music = music;
+        context.musicDjRoleId = config.music.djRoleId;
+        await music.resume();
+        info(`[음악] DB 재생목록 복원 | ${store.musicTracks(guild.id).length}곡 | 음성채널: ${config.music.voiceChannelId}`);
+        finishMusic();
+      } catch (error) {
+        log(`음악 초기화 점검 실패 (DB 재생목록 보존): ${errorMessage(error)}`);
+      }
+      if (closing) return;
+    } else info('[초기화] 음악 기능 비활성화 | MUSIC_VOICE_CHANNEL_ID·MUSIC_DJ_ROLE_ID 미설정');
+
     const panelStatus = panelReady ? '동기화 완료' : '복구 대기 (30초 간격)';
-    info(`${readyClient.user.tag} 준비 완료 | 서버: ${guild.name} | 시간대: Asia/Seoul | 역할 안내 메시지: ${panelStatus} | 초기화 소요: ${Math.round(performance.now() - startedAt)}ms`);
+    info(`${readyClient.user.tag} 준비 완료 | 서버: ${guild.name} | 시간대: Asia/Seoul | 역할 안내 메시지: ${panelStatus} | 음악: ${music ? '활성화' : '비활성화'} | 초기화 소요: ${Math.round(performance.now() - startedAt)}ms`);
   }
 
   client.once(Events.ClientReady, readyClient => {
